@@ -8,6 +8,7 @@ This script performs a comprehensive audit of AWS resources including:
 - IAM Resources (Users, Roles, Groups)
 - S3 Buckets
 - Lambda Functions
+- DynamoDB Tables
 
 Usage:
   python3 aws_resource_audit.py
@@ -47,7 +48,7 @@ def parse_arguments():
                        help='Comma-separated list of regions (e.g., us-east-1,eu-west-1) or "all" for all regions',
                        default='all')
     parser.add_argument('--services', type=str, 
-                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3,lambda)',
+                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3,lambda,dynamodb)',
                        default='all')
     return parser.parse_args()
 
@@ -123,7 +124,57 @@ def process_region(session, region):
     except Exception as e:
         print(f"Unexpected error processing region {region}: {str(e)}")
         return None
-    
+
+def audit_dynamodb(session, region):
+    """Audit DynamoDB tables in a region"""
+    print("  Checking DynamoDB tables...")
+    dynamodb = session.client('dynamodb', region_name=region)
+    dynamodb_resources = []
+
+    try:
+        paginator = dynamodb.get_paginator('list_tables')
+        for page in paginator.paginate():
+            for table_name in page['TableNames']:
+                try:
+                    table = dynamodb.describe_table(TableName=table_name)['Table']
+                    tags_response = dynamodb.list_tags_of_resource(
+                        ResourceArn=table['TableArn']
+                    )
+                    
+                    try:
+                        backup_status = dynamodb.describe_continuous_backups(
+                            TableName=table_name
+                        )['ContinuousBackupsDescription']['PointInTimeRecoveryDescription']['PointInTimeRecoveryStatus']
+                    except:
+                        backup_status = 'DISABLED'
+
+                    dynamodb_resources.append({
+                        'Region': region,
+                        'Table Name': table['TableName'],
+                        'ARN': table['TableArn'],
+                        'Status': table['TableStatus'],
+                        'Creation Time': str(table['CreationDateTime']),
+                        'Item Count': table.get('ItemCount', 0),
+                        'Size (Bytes)': table.get('TableSizeBytes', 0),
+                        'Billing Mode': table.get('BillingModeSummary', {}).get('BillingMode', 'PROVISIONED'),
+                        'Read Capacity': table.get('ProvisionedThroughput', {}).get('ReadCapacityUnits', 'N/A'),
+                        'Write Capacity': table.get('ProvisionedThroughput', {}).get('WriteCapacityUnits', 'N/A'),
+                        'Point-in-Time Recovery': backup_status,
+                        'Stream Enabled': table.get('StreamSpecification', {}).get('StreamEnabled', False),
+                        'Encryption Type': table.get('SSEDescription', {}).get('SSEType', 'N/A'),
+                        'Global Table': bool(table.get('GlobalTableVersion', False)),
+                        'Tags': ', '.join([f"{tag['Key']}={tag['Value']}" for tag in tags_response.get('Tags', [])])
+                    })
+
+                except ClientError as e:
+                    print(f"Error processing table {table_name}: {str(e)}")
+                    continue
+
+    except ClientError as e:
+        print(f"Error auditing DynamoDB in {region}: {str(e)}")
+
+    return dynamodb_resources
+
 def get_resources(session, region):
     """Collect all AWS resources for a given region"""
     print(f"\nAuditing region: {region}")
@@ -131,7 +182,8 @@ def get_resources(session, region):
         'ec2': [],
         'rds': [],
         'vpc': [],
-        'lambda': []
+        'lambda': [],
+        'dynamodb': []
     }
 
     try:
@@ -220,6 +272,9 @@ def get_resources(session, region):
 
         # Lambda Resources
         resources['lambda'] = audit_lambda(session, region)
+        
+        # DynamoDB Resources
+        resources['dynamodb'] = audit_dynamodb(session, region)
 
     except ClientError as e:
         print(f"Error in region {region}: {str(e)}")
@@ -229,6 +284,7 @@ def get_resources(session, region):
     print(f"    RDS instances: {len(resources['rds'])}")
     print(f"    VPC resources: {len(resources['vpc'])}")
     print(f"    Lambda functions: {len(resources['lambda'])}")
+    print(f"    DynamoDB tables: {len(resources['dynamodb'])}")
     
     return resources
 
@@ -382,62 +438,6 @@ def get_vpc_peering_details(ec2, vpc_id, region):
         print(f"Error getting VPC peering details for VPC {vpc_id}: {str(e)}")
     return peering_connections
 
-def audit_lambda(session, region):
-    """Audit Lambda functions in a region"""
-    print("  Checking Lambda functions...")
-    lambda_client = session.client('lambda', region_name=region)
-    lambda_resources = []
-
-    try:
-        paginator = lambda_client.get_paginator('list_functions')
-        for page in paginator.paginate():
-            for function in page['Functions']:
-                try:
-                    policy = lambda_client.get_policy(FunctionName=function['FunctionName'])
-                    policy_json = json.loads(policy['Policy'])
-                except ClientError:
-                    policy_json = {}
-
-                try:
-                    tags = lambda_client.list_tags(Resource=function['FunctionArn'])['Tags']
-                except ClientError:
-                    tags = {}
-
-                try:
-                    concurrency = lambda_client.get_function_concurrency(
-                        FunctionName=function['FunctionName']
-                    ).get('ReservedConcurrentExecutions', 'Not configured')
-                except ClientError:
-                    concurrency = 'Error retrieving'
-
-                lambda_resources.append({
-                    'Region': region,
-                    'Function Name': function['FunctionName'],
-                    'ARN': function['FunctionArn'],
-                    'Runtime': function['Runtime'],
-                    'Handler': function['Handler'],
-                    'Code Size': f"{function['CodeSize'] / (1024*1024):.2f} MB",
-                    'Memory': f"{function['MemorySize']} MB",
-                    'Timeout': f"{function['Timeout']} seconds",
-                    'Last Modified': function['LastModified'],
-                    'Environment Variables': len(function.get('Environment', {}).get('Variables', {})),
-                    'Layers': len(function.get('Layers', [])),
-                    'VPC Config': 'Yes' if function.get('VpcConfig', {}).get('VpcId') else 'No',
-                    'VPC ID': function.get('VpcConfig', {}).get('VpcId', 'N/A'),
-                    'Subnets': ', '.join(function.get('VpcConfig', {}).get('SubnetIds', [])),
-                    'Security Groups': ', '.join(function.get('VpcConfig', {}).get('SecurityGroupIds', [])),
-                    'Reserved Concurrency': concurrency,
-                    'Architecture': function.get('Architectures', ['x86_64'])[0],
-                    'Package Type': function.get('PackageType', 'Zip'),
-                    'Resource Policy': bool(policy_json),
-                    'Tags': ', '.join([f"{k}={v}" for k, v in tags.items()]) if tags else 'No Tags'
-                })
-
-    except ClientError as e:
-        print(f"Error auditing Lambda functions in {region}: {str(e)}")
-
-    return lambda_resources
-
 def get_transit_gateway_details(ec2, vpc_id, region):
     """Get detailed information about Transit Gateway attachments and routes"""
     tgw_resources = {
@@ -503,6 +503,62 @@ def get_transit_gateway_details(ec2, vpc_id, region):
         print(f"Error getting Transit Gateway details for VPC {vpc_id}: {str(e)}")
     
     return tgw_resources
+
+def audit_lambda(session, region):
+    """Audit Lambda functions in a region"""
+    print("  Checking Lambda functions...")
+    lambda_client = session.client('lambda', region_name=region)
+    lambda_resources = []
+
+    try:
+        paginator = lambda_client.get_paginator('list_functions')
+        for page in paginator.paginate():
+            for function in page['Functions']:
+                try:
+                    policy = lambda_client.get_policy(FunctionName=function['FunctionName'])
+                    policy_json = json.loads(policy['Policy'])
+                except ClientError:
+                    policy_json = {}
+
+                try:
+                    tags = lambda_client.list_tags(Resource=function['FunctionArn'])['Tags']
+                except ClientError:
+                    tags = {}
+
+                try:
+                    concurrency = lambda_client.get_function_concurrency(
+                        FunctionName=function['FunctionName']
+                    ).get('ReservedConcurrentExecutions', 'Not configured')
+                except ClientError:
+                    concurrency = 'Error retrieving'
+
+                lambda_resources.append({
+                    'Region': region,
+                    'Function Name': function['FunctionName'],
+                    'ARN': function['FunctionArn'],
+                    'Runtime': function['Runtime'],
+                    'Handler': function['Handler'],
+                    'Code Size': f"{function['CodeSize'] / (1024*1024):.2f} MB",
+                    'Memory': f"{function['MemorySize']} MB",
+                    'Timeout': f"{function['Timeout']} seconds",
+                    'Last Modified': function['LastModified'],
+                    'Environment Variables': len(function.get('Environment', {}).get('Variables', {})),
+                    'Layers': len(function.get('Layers', [])),
+                    'VPC Config': 'Yes' if function.get('VpcConfig', {}).get('VpcId') else 'No',
+                    'VPC ID': function.get('VpcConfig', {}).get('VpcId', 'N/A'),
+                    'Subnets': ', '.join(function.get('VpcConfig', {}).get('SubnetIds', [])),
+                    'Security Groups': ', '.join(function.get('VpcConfig', {}).get('SecurityGroupIds', [])),
+                    'Reserved Concurrency': concurrency,
+                    'Architecture': function.get('Architectures', ['x86_64'])[0],
+                    'Package Type': function.get('PackageType', 'Zip'),
+                    'Resource Policy': bool(policy_json),
+                    'Tags': ', '.join([f"{k}={v}" for k, v in tags.items()]) if tags else 'No Tags'
+                })
+
+    except ClientError as e:
+        print(f"Error auditing Lambda functions in {region}: {str(e)}")
+
+    return lambda_resources
 
 def get_base_vpc_details(ec2, vpc_id, region):
     """Get basic VPC component information"""
@@ -624,7 +680,7 @@ def get_vpc_details(ec2, vpc_id, region):
     except ClientError as e:
         print(f"Error getting VPC details for {vpc_id}: {str(e)}")
         return {}
-
+    
 def audit_iam(session):
     """Audit IAM resources"""
     print("\nAuditing IAM resources...")
@@ -669,8 +725,8 @@ def audit_iam(session):
                     'AttachedPolicies': ', '.join([p['PolicyName'] for p in attached_policies]),
                     'InlinePolicies': len(inline_policies)
                 })
-                
-# Get Roles
+
+        # Get Roles
         paginator = iam.get_paginator('list_roles')
         for page in paginator.paginate():
             for role in page['Roles']:
@@ -925,11 +981,9 @@ def write_excel(all_results, output_path):
             'border': 1
         })
 
-        # Write IAM sheets
         if 'iam' in all_results:
             write_iam_sheets(writer, all_results['iam'], header_format)
         
-        # Write S3 sheet
         if 's3' in all_results:
             write_s3_sheet(writer, all_results['s3'], header_format)
         
@@ -938,6 +992,7 @@ def write_excel(all_results, output_path):
         rds_resources = []
         vpc_resources = []
         lambda_resources = []
+        dynamodb_resources = []
 
         if 'regions' in all_results:
             for region, region_data in all_results['regions'].items():
@@ -949,8 +1004,9 @@ def write_excel(all_results, output_path):
                     vpc_resources.extend(region_data['vpc'])
                 if isinstance(region_data.get('lambda'), list):
                     lambda_resources.extend(region_data['lambda'])
+                if isinstance(region_data.get('dynamodb'), list):
+                    dynamodb_resources.extend(region_data['dynamodb'])
 
-        # Write regional resource sheets
         if ec2_resources:
             write_dataframe(writer, 'EC2 Instances', ec2_resources, header_format)
         if rds_resources:
@@ -959,14 +1015,16 @@ def write_excel(all_results, output_path):
             write_vpc_sheets(writer, vpc_resources, header_format)
         if lambda_resources:
             write_dataframe(writer, 'Lambda Functions', lambda_resources, header_format)
+        if dynamodb_resources:
+            write_dataframe(writer, 'DynamoDB Tables', dynamodb_resources, header_format)
 
-        # Add resource counts sheet
         debug_info = [
             {'Category': 'Regions Found', 'Count': len(all_results.get('regions', {}))},
             {'Category': 'EC2 Instances', 'Count': len(ec2_resources)},
             {'Category': 'RDS Instances', 'Count': len(rds_resources)},
             {'Category': 'VPC Resources', 'Count': len(vpc_resources)},
             {'Category': 'Lambda Functions', 'Count': len(lambda_resources)},
+            {'Category': 'DynamoDB Tables', 'Count': len(dynamodb_resources)},
             {'Category': 'IAM Users', 'Count': len(all_results.get('iam', {}).get('users', []))},
             {'Category': 'IAM Roles', 'Count': len(all_results.get('iam', {}).get('roles', []))},
             {'Category': 'IAM Groups', 'Count': len(all_results.get('iam', {}).get('groups', []))},
@@ -974,7 +1032,6 @@ def write_excel(all_results, output_path):
         ]
         write_dataframe(writer, 'Resource Counts', debug_info, header_format)
 
-        # Add region processing summary
         summary_info = [
             {'Category': 'Total Regions', 'Count': len(all_results.get('regions', {}))},
             {'Category': 'Successful Regions', 
@@ -992,7 +1049,7 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
 
     session = boto3.Session()
-    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3', 'lambda']
+    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3', 'lambda', 'dynamodb']
     
     try:
         ec2 = session.client('ec2')
