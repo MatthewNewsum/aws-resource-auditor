@@ -13,12 +13,13 @@ Done:
   - Routes
 - DynamoDB
 - Lambda Functions
+- Bedrock
 
 Combine Route Table list and Routes into 1 sheet
 
 In Progress:
 
-
+- Bedrock use?
 
 To Do:
 
