@@ -2,17 +2,22 @@ Prompt
 
 Refer to the attached code.  Change or remove no functionality just add what we discuss.  output can be in sections i will re assemble if the output is too long.  Be clear on what to add and where to add it. 
 
+regenerate the entire file as multipart and ill recombine - OMIT NOTHING start at the top and work to the end.
+
+
 Done:
 - IAM
 - S3 Bucket sizes and object counts
 - VPC
   - Route Table list
   - Routes
-  
+- DynamoDB
+- Lambda Functions
+
 Combine Route Table list and Routes into 1 sheet
 
 In Progress:
-- Lambda Functions
+
 
 
 To Do:
