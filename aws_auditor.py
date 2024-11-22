@@ -9,6 +9,7 @@ This script performs a comprehensive audit of AWS resources including:
 - S3 Buckets
 - Lambda Functions
 - DynamoDB Tables
+- Bedrock Models and Foundations
 
 Usage:
   python3 aws_resource_audit.py
@@ -48,7 +49,7 @@ def parse_arguments():
                        help='Comma-separated list of regions (e.g., us-east-1,eu-west-1) or "all" for all regions',
                        default='all')
     parser.add_argument('--services', type=str, 
-                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3,lambda,dynamodb)',
+                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3,lambda,dynamodb,bedrock)',
                        default='all')
     return parser.parse_args()
 
@@ -175,6 +176,47 @@ def audit_dynamodb(session, region):
 
     return dynamodb_resources
 
+def audit_bedrock(session, region):
+    """Audit Bedrock resources in a region"""
+    print("  Checking Bedrock resources...")
+    bedrock = session.client('bedrock', region_name=region)
+    bedrock_resources = []
+
+    try:
+        # List foundation models
+        models = bedrock.list_foundation_models()
+        for model in models['modelSummaries']:
+            try:
+                # Get detailed model info
+                model_details = bedrock.get_foundation_model(
+                    modelIdentifier=model['modelId']
+                )
+
+                bedrock_resources.append({
+                    'Region': region,
+                    'Model ID': model['modelId'],
+                    'Model Name': model['modelName'],
+                    'Provider': model['providerName'],
+                    'Status': model.get('modelLifecycle', {}).get('status', 'N/A'),
+                    'Input Modalities': ', '.join(model.get('inputModalities', [])),
+                    'Output Modalities': ', '.join(model.get('outputModalities', [])),
+                    'Custom Model': model.get('customizationsSupported', False),
+                    'Fine Tuning Supported': model.get('customModelSupported', False),
+                    'Response Streaming': model.get('responseStreamingSupported', False),
+                    'Model ARN': model.get('modelArn', 'N/A'),
+                    'Created At': str(model.get('createdAt', 'N/A')),
+                    'Last Modified': str(model.get('lastModifiedAt', 'N/A'))
+                })
+
+            except ClientError as e:
+                print(f"Error getting details for model {model['modelId']}: {str(e)}")
+                continue
+
+    except ClientError as e:
+        print(f"Error auditing Bedrock in {region}: {str(e)}")
+
+    return bedrock_resources
+
 def get_resources(session, region):
     """Collect all AWS resources for a given region"""
     print(f"\nAuditing region: {region}")
@@ -183,7 +225,8 @@ def get_resources(session, region):
         'rds': [],
         'vpc': [],
         'lambda': [],
-        'dynamodb': []
+        'dynamodb': [],
+        'bedrock': []
     }
 
     try:
@@ -276,6 +319,9 @@ def get_resources(session, region):
         # DynamoDB Resources
         resources['dynamodb'] = audit_dynamodb(session, region)
 
+        # Bedrock Resources
+        resources['bedrock'] = audit_bedrock(session, region)
+
     except ClientError as e:
         print(f"Error in region {region}: {str(e)}")
         
@@ -285,6 +331,7 @@ def get_resources(session, region):
     print(f"    VPC resources: {len(resources['vpc'])}")
     print(f"    Lambda functions: {len(resources['lambda'])}")
     print(f"    DynamoDB tables: {len(resources['dynamodb'])}")
+    print(f"    Bedrock models: {len(resources['bedrock'])}")
     
     return resources
 
@@ -882,6 +929,7 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
             'Flow Logs Enabled': vpc['Flow Logs Enabled']
         })
         
+# Continued from write_vpc_sheets function
         subnets_all.extend(vpc.get('subnets', []))
         igw_all.extend(vpc.get('internet_gateways', []))
         nat_all.extend(vpc.get('nat_gateways', []))
@@ -959,7 +1007,7 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
     write_dataframe(writer, 'Transit Gateway Attachments', tgw_attachments, header_format)
     write_dataframe(writer, 'Transit Gateway Route Tables', tgw_route_tables, header_format)
     write_dataframe(writer, 'Transit Gateway Routes', tgw_routes, header_format)
-
+    
 def write_iam_sheets(writer, iam_resources, header_format):
     write_dataframe(writer, 'IAM Users', iam_resources['users'], header_format)
     write_dataframe(writer, 'IAM Roles', iam_resources['roles'], header_format)
@@ -993,6 +1041,7 @@ def write_excel(all_results, output_path):
         vpc_resources = []
         lambda_resources = []
         dynamodb_resources = []
+        bedrock_resources = []
 
         if 'regions' in all_results:
             for region, region_data in all_results['regions'].items():
@@ -1006,6 +1055,8 @@ def write_excel(all_results, output_path):
                     lambda_resources.extend(region_data['lambda'])
                 if isinstance(region_data.get('dynamodb'), list):
                     dynamodb_resources.extend(region_data['dynamodb'])
+                if isinstance(region_data.get('bedrock'), list):
+                    bedrock_resources.extend(region_data['bedrock'])
 
         if ec2_resources:
             write_dataframe(writer, 'EC2 Instances', ec2_resources, header_format)
@@ -1017,6 +1068,8 @@ def write_excel(all_results, output_path):
             write_dataframe(writer, 'Lambda Functions', lambda_resources, header_format)
         if dynamodb_resources:
             write_dataframe(writer, 'DynamoDB Tables', dynamodb_resources, header_format)
+        if bedrock_resources:
+            write_dataframe(writer, 'Bedrock Models', bedrock_resources, header_format)
 
         debug_info = [
             {'Category': 'Regions Found', 'Count': len(all_results.get('regions', {}))},
@@ -1025,6 +1078,7 @@ def write_excel(all_results, output_path):
             {'Category': 'VPC Resources', 'Count': len(vpc_resources)},
             {'Category': 'Lambda Functions', 'Count': len(lambda_resources)},
             {'Category': 'DynamoDB Tables', 'Count': len(dynamodb_resources)},
+            {'Category': 'Bedrock Models', 'Count': len(bedrock_resources)},
             {'Category': 'IAM Users', 'Count': len(all_results.get('iam', {}).get('users', []))},
             {'Category': 'IAM Roles', 'Count': len(all_results.get('iam', {}).get('roles', []))},
             {'Category': 'IAM Groups', 'Count': len(all_results.get('iam', {}).get('groups', []))},
@@ -1049,7 +1103,7 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
 
     session = boto3.Session()
-    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3', 'lambda', 'dynamodb']
+    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3', 'lambda', 'dynamodb', 'bedrock']
     
     try:
         ec2 = session.client('ec2')
@@ -1140,3 +1194,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error in main execution: {e}")
             sys.exit(1)
+            
