@@ -3,10 +3,12 @@ Prompt
 Refer to the attached code.  Change or remove no functionality just add what we discuss.  output can be in sections i will re assemble if the output is too long.  Be clear on what to add and where to add it. 
 
 Done:
-
-- get S3 Bucket sizes and object counts
-- Route Table list
-- Routes
+- IAM
+- S3 Bucket sizes and object counts
+- VPC
+  - Route Table list
+  - Routes
+  
 Combine Route Table list and Routes into 1 sheet
 
 In Progress:
