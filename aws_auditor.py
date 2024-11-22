@@ -7,6 +7,7 @@ This script performs a comprehensive audit of AWS resources including:
 - VPC Resources (VPCs, Subnets, IGWs, NAT Gateways)
 - IAM Resources (Users, Roles, Groups)
 - S3 Buckets
+- Lambda Functions
 
 Usage:
   python3 aws_resource_audit.py
@@ -46,7 +47,7 @@ def parse_arguments():
                        help='Comma-separated list of regions (e.g., us-east-1,eu-west-1) or "all" for all regions',
                        default='all')
     parser.add_argument('--services', type=str, 
-                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3)',
+                       help='Comma-separated list of services (ec2,rds,vpc,iam,s3,lambda)',
                        default='all')
     return parser.parse_args()
 
@@ -77,7 +78,6 @@ def get_s3_metrics(s3, cloudwatch, bucket_name):
     }
     
     try:
-        # Get total objects and size
         total_size = 0
         total_objects = 0
         paginator = s3.get_paginator('list_objects_v2')
@@ -88,13 +88,12 @@ def get_s3_metrics(s3, cloudwatch, bucket_name):
                     total_size += obj.get('Size', 0)
                     total_objects += 1
         
-        # Convert bytes to appropriate unit
         if total_size > 0:
-            if total_size >= 1024**4:  # TB range
+            if total_size >= 1024**4:
                 size_str = f"{total_size / (1024**4):.2f} TB"
-            elif total_size >= 1024**3:  # GB range
+            elif total_size >= 1024**3:
                 size_str = f"{total_size / (1024**3):.2f} GB"
-            elif total_size >= 1024**2:  # MB range
+            elif total_size >= 1024**2:
                 size_str = f"{total_size / (1024**2):.2f} MB"
             else:
                 size_str = f"{total_size / 1024:.2f} KB"
@@ -104,7 +103,6 @@ def get_s3_metrics(s3, cloudwatch, bucket_name):
                 
     except Exception as e:
         print(f"Error getting metrics for bucket {bucket_name}: {str(e)}")
-        # Keep the N/A values set at initialization
     
     return results
 
@@ -125,14 +123,15 @@ def process_region(session, region):
     except Exception as e:
         print(f"Unexpected error processing region {region}: {str(e)}")
         return None
-
+    
 def get_resources(session, region):
     """Collect all AWS resources for a given region"""
     print(f"\nAuditing region: {region}")
     resources = {
         'ec2': [],
         'rds': [],
-        'vpc': []
+        'vpc': [],
+        'lambda': []
     }
 
     try:
@@ -197,7 +196,7 @@ def get_resources(session, region):
         except ClientError as e:
             print(f"  Error accessing RDS: {e}")
 
-        # VPC Resources will be handled in the next section
+        # VPC Resources
         print("  Checking VPC resources...")
         try:
             vpcs = ec2.describe_vpcs()['Vpcs']
@@ -219,6 +218,9 @@ def get_resources(session, region):
         except ClientError as e:
             print(f"  Error accessing VPCs: {str(e)}")
 
+        # Lambda Resources
+        resources['lambda'] = audit_lambda(session, region)
+
     except ClientError as e:
         print(f"Error in region {region}: {str(e)}")
         
@@ -226,13 +228,12 @@ def get_resources(session, region):
     print(f"    EC2 instances: {len(resources['ec2'])}")
     print(f"    RDS instances: {len(resources['rds'])}")
     print(f"    VPC resources: {len(resources['vpc'])}")
+    print(f"    Lambda functions: {len(resources['lambda'])}")
     
     return resources
 
 def get_route_table_details(ec2, vpc_id, region):
-    """Get detailed information about route tables and their routes"""
     route_tables = []
-    
     try:
         paginator = ec2.get_paginator('describe_route_tables')
         for page in paginator.paginate(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]):
@@ -247,7 +248,6 @@ def get_route_table_details(ec2, vpc_id, region):
                     'Associated Subnets': ', '.join([assoc['SubnetId'] for assoc in rt.get('Associations', []) 
                                                    if 'SubnetId' in assoc])
                 }
-                
                 routes = []
                 for route in rt.get('Routes', []):
                     route_info = {
@@ -259,19 +259,14 @@ def get_route_table_details(ec2, vpc_id, region):
                         'Origin': route.get('Origin', 'N/A')
                     }
                     routes.append(route_info)
-                
                 rt_info['Routes'] = routes
                 route_tables.append(rt_info)
-                
     except ClientError as e:
         print(f"Error getting route table details for VPC {vpc_id}: {str(e)}")
-    
     return route_tables
 
 def get_security_group_details(ec2, vpc_id, region):
-    """Get detailed information about security groups and their rules"""
     security_groups = []
-    
     try:
         paginator = ec2.get_paginator('describe_security_groups')
         for page in paginator.paginate(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]):
@@ -283,8 +278,6 @@ def get_security_group_details(ec2, vpc_id, region):
                     'Name': sg['GroupName'],
                     'Description': sg['Description']
                 }
-                
-                # Process inbound rules
                 inbound_rules = []
                 for rule in sg.get('IpPermissions', []):
                     rule_info = {
@@ -298,7 +291,6 @@ def get_security_group_details(ec2, vpc_id, region):
                     inbound_rules.append(rule_info)
                 sg_info['Inbound Rules'] = inbound_rules
                 
-                # Process outbound rules
                 outbound_rules = []
                 for rule in sg.get('IpPermissionsEgress', []):
                     rule_info = {
@@ -311,18 +303,13 @@ def get_security_group_details(ec2, vpc_id, region):
                     }
                     outbound_rules.append(rule_info)
                 sg_info['Outbound Rules'] = outbound_rules
-                
                 security_groups.append(sg_info)
-                
     except ClientError as e:
         print(f"Error getting security group details for VPC {vpc_id}: {str(e)}")
-    
     return security_groups
 
 def get_vpc_endpoint_details(ec2, vpc_id, region):
-    """Get detailed information about VPC endpoints"""
     vpc_endpoints = []
-    
     try:
         paginator = ec2.get_paginator('describe_vpc_endpoints')
         for page in paginator.paginate(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}]):
@@ -341,16 +328,12 @@ def get_vpc_endpoint_details(ec2, vpc_id, region):
                     'Network Interfaces': ', '.join(endpoint.get('NetworkInterfaceIds', []))
                 }
                 vpc_endpoints.append(endpoint_info)
-                
     except ClientError as e:
         print(f"Error getting VPC endpoint details for VPC {vpc_id}: {str(e)}")
-    
     return vpc_endpoints
 
 def get_vpc_peering_details(ec2, vpc_id, region):
-    """Get detailed information about VPC peering connections"""
     peering_connections = []
-    
     try:
         paginator = ec2.get_paginator('describe_vpc_peering_connections')
         filters = [{'Name': 'requester-vpc-info.vpc-id', 'Values': [vpc_id]}]
@@ -395,11 +378,65 @@ def get_vpc_peering_details(ec2, vpc_id, region):
                     'DNS Resolution': pcx.get('AccepterVpcInfo', {}).get('PeeringOptions', {}).get('AllowDnsResolutionFromRemoteVpc', False)
                 }
                 peering_connections.append(pcx_info)
-                
     except ClientError as e:
         print(f"Error getting VPC peering details for VPC {vpc_id}: {str(e)}")
-    
     return peering_connections
+
+def audit_lambda(session, region):
+    """Audit Lambda functions in a region"""
+    print("  Checking Lambda functions...")
+    lambda_client = session.client('lambda', region_name=region)
+    lambda_resources = []
+
+    try:
+        paginator = lambda_client.get_paginator('list_functions')
+        for page in paginator.paginate():
+            for function in page['Functions']:
+                try:
+                    policy = lambda_client.get_policy(FunctionName=function['FunctionName'])
+                    policy_json = json.loads(policy['Policy'])
+                except ClientError:
+                    policy_json = {}
+
+                try:
+                    tags = lambda_client.list_tags(Resource=function['FunctionArn'])['Tags']
+                except ClientError:
+                    tags = {}
+
+                try:
+                    concurrency = lambda_client.get_function_concurrency(
+                        FunctionName=function['FunctionName']
+                    ).get('ReservedConcurrentExecutions', 'Not configured')
+                except ClientError:
+                    concurrency = 'Error retrieving'
+
+                lambda_resources.append({
+                    'Region': region,
+                    'Function Name': function['FunctionName'],
+                    'ARN': function['FunctionArn'],
+                    'Runtime': function['Runtime'],
+                    'Handler': function['Handler'],
+                    'Code Size': f"{function['CodeSize'] / (1024*1024):.2f} MB",
+                    'Memory': f"{function['MemorySize']} MB",
+                    'Timeout': f"{function['Timeout']} seconds",
+                    'Last Modified': function['LastModified'],
+                    'Environment Variables': len(function.get('Environment', {}).get('Variables', {})),
+                    'Layers': len(function.get('Layers', [])),
+                    'VPC Config': 'Yes' if function.get('VpcConfig', {}).get('VpcId') else 'No',
+                    'VPC ID': function.get('VpcConfig', {}).get('VpcId', 'N/A'),
+                    'Subnets': ', '.join(function.get('VpcConfig', {}).get('SubnetIds', [])),
+                    'Security Groups': ', '.join(function.get('VpcConfig', {}).get('SecurityGroupIds', [])),
+                    'Reserved Concurrency': concurrency,
+                    'Architecture': function.get('Architectures', ['x86_64'])[0],
+                    'Package Type': function.get('PackageType', 'Zip'),
+                    'Resource Policy': bool(policy_json),
+                    'Tags': ', '.join([f"{k}={v}" for k, v in tags.items()]) if tags else 'No Tags'
+                })
+
+    except ClientError as e:
+        print(f"Error auditing Lambda functions in {region}: {str(e)}")
+
+    return lambda_resources
 
 def get_transit_gateway_details(ec2, vpc_id, region):
     """Get detailed information about Transit Gateway attachments and routes"""
@@ -424,7 +461,6 @@ def get_transit_gateway_details(ec2, vpc_id, region):
                 }
                 tgw_resources['attachments'].append(attachment_info)
                 
-                # Get associated route tables
                 try:
                     rt_response = ec2.describe_transit_gateway_route_tables(
                         Filters=[{'Name': 'transit-gateway-id', 'Values': [attachment['TransitGatewayId']]}]
@@ -588,7 +624,7 @@ def get_vpc_details(ec2, vpc_id, region):
     except ClientError as e:
         print(f"Error getting VPC details for {vpc_id}: {str(e)}")
         return {}
-    
+
 def audit_iam(session):
     """Audit IAM resources"""
     print("\nAuditing IAM resources...")
@@ -633,8 +669,8 @@ def audit_iam(session):
                     'AttachedPolicies': ', '.join([p['PolicyName'] for p in attached_policies]),
                     'InlinePolicies': len(inline_policies)
                 })
-
-        # Get Roles
+                
+# Get Roles
         paginator = iam.get_paginator('list_roles')
         for page in paginator.paginate():
             for role in page['Roles']:
@@ -694,14 +730,12 @@ def audit_s3(session):
                 location = s3.get_bucket_location(Bucket=bucket['Name'])
                 region = location['LocationConstraint'] or 'us-east-1'
                 
-                # Get bucket versioning
                 try:
                     versioning = s3.get_bucket_versioning(Bucket=bucket['Name'])
                     versioning_status = versioning.get('Status', 'Disabled')
                 except:
                     versioning_status = 'Unknown'
                 
-                # Get bucket encryption
                 try:
                     encryption = s3.get_bucket_encryption(Bucket=bucket['Name'])
                     encryption_enabled = True
@@ -710,35 +744,30 @@ def audit_s3(session):
                     encryption_enabled = False
                     encryption_type = 'None'
                 
-                # Get public access block
                 try:
                     public_access = s3.get_public_access_block(Bucket=bucket['Name'])
                     public_access_blocked = all(public_access['PublicAccessBlockConfiguration'].values())
                 except:
                     public_access_blocked = 'Unknown'
                     
-                # Get bucket policy status
                 try:
                     policy_status = s3.get_bucket_policy_status(Bucket=bucket['Name'])
                     is_public = policy_status['PolicyStatus']['IsPublic']
                 except:
                     is_public = 'Unknown'
 
-                # Get bucket lifecycle rules
                 try:
                     lifecycle = s3.get_bucket_lifecycle_configuration(Bucket=bucket['Name'])
                     has_lifecycle_rules = len(lifecycle.get('Rules', [])) > 0
                 except:
                     has_lifecycle_rules = False
 
-                # Get bucket tagging
                 try:
                     tags = s3.get_bucket_tagging(Bucket=bucket['Name'])
                     tag_list = [f"{tag['Key']}={tag['Value']}" for tag in tags.get('TagSet', [])]
                 except:
                     tag_list = []
 
-                # Get bucket metrics
                 metrics = get_s3_metrics(s3, cloudwatch, bucket['Name'])
 
                 s3_resources.append({
@@ -801,7 +830,6 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
         igw_all.extend(vpc.get('internet_gateways', []))
         nat_all.extend(vpc.get('nat_gateways', []))
         
-        # Process route tables and routes together
         for rt in vpc.get('route_tables', []):
             rt_base = {
                 'Region': rt['Region'],
@@ -813,10 +841,8 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
             }
             
             if not rt.get('Routes'):
-                # Add single entry for route table with no routes
                 combined_routes.append(rt_base)
             else:
-                # Add entry for each route with route table info
                 for route in rt.get('Routes', []):
                     route_entry = rt_base.copy()
                     route_entry.update({
@@ -879,13 +905,11 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
     write_dataframe(writer, 'Transit Gateway Routes', tgw_routes, header_format)
 
 def write_iam_sheets(writer, iam_resources, header_format):
-    """Write IAM resources to Excel sheets"""
     write_dataframe(writer, 'IAM Users', iam_resources['users'], header_format)
     write_dataframe(writer, 'IAM Roles', iam_resources['roles'], header_format)
     write_dataframe(writer, 'IAM Groups', iam_resources['groups'], header_format)
 
 def write_s3_sheet(writer, s3_resources, header_format):
-    """Write S3 resources to Excel sheet"""
     write_dataframe(writer, 'S3 Buckets', s3_resources, header_format)
 
 def write_excel(all_results, output_path):
@@ -913,6 +937,7 @@ def write_excel(all_results, output_path):
         ec2_resources = []
         rds_resources = []
         vpc_resources = []
+        lambda_resources = []
 
         if 'regions' in all_results:
             for region, region_data in all_results['regions'].items():
@@ -922,18 +947,18 @@ def write_excel(all_results, output_path):
                     rds_resources.extend(region_data['rds'])
                 if isinstance(region_data.get('vpc'), list):
                     vpc_resources.extend(region_data['vpc'])
+                if isinstance(region_data.get('lambda'), list):
+                    lambda_resources.extend(region_data['lambda'])
 
-        # Write EC2 sheet
+        # Write regional resource sheets
         if ec2_resources:
             write_dataframe(writer, 'EC2 Instances', ec2_resources, header_format)
-
-        # Write RDS sheet
         if rds_resources:
             write_dataframe(writer, 'RDS Instances', rds_resources, header_format)
-
-        # Write VPC sheets
         if vpc_resources:
             write_vpc_sheets(writer, vpc_resources, header_format)
+        if lambda_resources:
+            write_dataframe(writer, 'Lambda Functions', lambda_resources, header_format)
 
         # Add resource counts sheet
         debug_info = [
@@ -941,6 +966,7 @@ def write_excel(all_results, output_path):
             {'Category': 'EC2 Instances', 'Count': len(ec2_resources)},
             {'Category': 'RDS Instances', 'Count': len(rds_resources)},
             {'Category': 'VPC Resources', 'Count': len(vpc_resources)},
+            {'Category': 'Lambda Functions', 'Count': len(lambda_resources)},
             {'Category': 'IAM Users', 'Count': len(all_results.get('iam', {}).get('users', []))},
             {'Category': 'IAM Roles', 'Count': len(all_results.get('iam', {}).get('roles', []))},
             {'Category': 'IAM Groups', 'Count': len(all_results.get('iam', {}).get('groups', []))},
@@ -957,20 +983,17 @@ def write_excel(all_results, output_path):
              'Count': len([r for r in all_results['regions'].values() if 'error' in r])}
         ]
         write_dataframe(writer, 'Region Summary', summary_info, header_format)
-
+        
 def main():
     args = parse_arguments()
     
-    # Create results directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
     results_dir = os.path.join(script_dir, 'results')
     os.makedirs(results_dir, exist_ok=True)
 
-    # Initialize session and get services to audit
     session = boto3.Session()
-    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3']
+    services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3', 'lambda']
     
-    # Get regions to audit
     try:
         ec2 = session.client('ec2')
         available_regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
@@ -979,7 +1002,6 @@ def main():
             regions = available_regions
         else:
             requested_regions = args.regions.split(',')
-            # Validate requested regions
             invalid_regions = [r for r in requested_regions if r not in available_regions]
             if invalid_regions:
                 print(f"Warning: Invalid regions specified: {', '.join(invalid_regions)}")
@@ -1004,19 +1026,16 @@ def main():
         }
     }
 
-    # Audit global services
     if 'iam' in services:
         all_results['iam'] = audit_iam(session)
 
     if 's3' in services:
         all_results['s3'] = audit_s3(session)
 
-    # Initialize progress tracking
     print_lock = Lock()
     total_regions = len(regions)
     processed_regions = 0
 
-    # Process regions in parallel
     with ThreadPoolExecutor(max_workers=min(10, len(regions))) as executor:
         future_to_region = {executor.submit(process_region, session, region): region 
                           for region in regions}
@@ -1038,7 +1057,6 @@ def main():
                 print(f"Error processing region {region}: {str(e)}")
                 all_results['regions'][region] = {'error': str(e)}
 
-    # Generate reports
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     json_path = os.path.join(results_dir, f'aws_inventory_{timestamp}.json')
     excel_path = os.path.join(results_dir, f'aws_inventory_{timestamp}.xlsx')

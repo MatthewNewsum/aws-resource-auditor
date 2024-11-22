@@ -12,7 +12,7 @@ Done:
 Combine Route Table list and Routes into 1 sheet
 
 In Progress:
-
+- Lambda Functions
 
 
 To Do:
@@ -24,12 +24,8 @@ To Do:
 - Fix Security Groups with rules (put on one sheet)
 
 - ECS Clusters and Services
-- Lambda Functions
-- S3 Buckets
-- IAM Users and Roles
 - Elastic Load Balancers
 - Auto Scaling Groups
-```
 
 Add formatting options:
 Add color coding for statuses:
