@@ -26,6 +26,8 @@ from botocore.exceptions import ClientError
 import sys
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 def check_aws_connection():
     try:
@@ -41,7 +43,8 @@ def check_aws_connection():
 def parse_arguments():
     parser = argparse.ArgumentParser(description='AWS Resource Audit Tool')
     parser.add_argument('--regions', type=str, 
-                       help='Comma-separated list of regions (e.g., us-east-1,eu-west-1)')
+                       help='Comma-separated list of regions (e.g., us-east-1,eu-west-1) or "all" for all regions',
+                       default='all')
     parser.add_argument('--services', type=str, 
                        help='Comma-separated list of services (ec2,rds,vpc,iam,s3)',
                        default='all')
@@ -65,54 +68,7 @@ def write_dataframe(writer, sheet_name, data, header_format):
             worksheet.write(0, idx, col, header_format)
             worksheet.set_column(idx, idx, len(str(col)) + 2)
         print(f"  Added {len(data)} {sheet_name}")
-
-# def get_s3_metrics(s3, cloudwatch, bucket_name):
-#     """Get S3 bucket size and object count metrics"""
-#     end_time = datetime.now()
-#     start_time = end_time - timedelta(days=1)
-    
-#     metrics = {
-#         'BucketSizeBytes': {
-#             'MetricName': 'BucketSizeBytes',
-#             'StorageType': 'StandardStorage'
-#         },
-#         'NumberOfObjects': {
-#             'MetricName': 'NumberOfObjects',
-#             'StorageType': 'AllStorageTypes'
-#         }
-#     }
-    
-#     results = {}
-#     for metric_name, config in metrics.items():
-#         try:
-#             response = cloudwatch.get_metric_statistics(
-#                 Namespace='AWS/S3',
-#                 MetricName=config['MetricName'],
-#                 Dimensions=[
-#                     {'Name': 'BucketName', 'Value': bucket_name},
-#                     {'Name': 'StorageType', 'Value': config['StorageType']}
-#                 ],
-#                 StartTime=start_time,
-#                 EndTime=end_time,
-#                 Period=86400,
-#                 Statistics=['Average']
-#             )
-            
-#             if response['Datapoints']:
-#                 # Convert bytes to GB for bucket size
-#                 if metric_name == 'BucketSizeBytes':
-#                     results[metric_name] = f"{response['Datapoints'][0]['Average'] / (1024**3):.2f} GB"
-#                 else:
-#                     results[metric_name] = f"{int(response['Datapoints'][0]['Average']):,}"
-#             else:
-#                 results[metric_name] = 'N/A'
-                
-#         except Exception as e:
-#             print(f"Error getting {metric_name} for bucket {bucket_name}: {str(e)}")
-#             results[metric_name] = 'Error'
-    
-#     return results
-
+        
 def get_s3_metrics(s3, cloudwatch, bucket_name):
     """Get S3 bucket size and object count metrics using direct S3 API calls"""
     results = {
@@ -151,6 +107,127 @@ def get_s3_metrics(s3, cloudwatch, bucket_name):
         # Keep the N/A values set at initialization
     
     return results
+
+def process_region(session, region):
+    """Process a single region with error handling"""
+    try:
+        print(f"\nProcessing region: {region}")
+        resources = get_resources(session, region)
+        print(f"Successfully processed region: {region}")
+        return resources
+    except ClientError as e:
+        if 'AuthorizationError' in str(e) or 'OptInRequired' in str(e):
+            print(f"Region {region} is not enabled for this account. Skipping.")
+            return None
+        else:
+            print(f"Error processing region {region}: {str(e)}")
+            return None
+    except Exception as e:
+        print(f"Unexpected error processing region {region}: {str(e)}")
+        return None
+
+def get_resources(session, region):
+    """Collect all AWS resources for a given region"""
+    print(f"\nAuditing region: {region}")
+    resources = {
+        'ec2': [],
+        'rds': [],
+        'vpc': []
+    }
+
+    try:
+        ec2 = session.client('ec2', region_name=region)
+        print("  Checking EC2 instances...")
+        
+        try:
+            eips = ec2.describe_addresses()['Addresses']
+            eip_map = {eip.get('InstanceId'): eip for eip in eips if eip.get('InstanceId')}
+        except ClientError as e:
+            print(f"  Error accessing EIPs: {e}")
+            eip_map = {}
+            
+        paginator = ec2.get_paginator('describe_instances')
+        for page in paginator.paginate():
+            for reservation in page['Reservations']:
+                for instance in reservation['Instances']:
+                    eip_info = eip_map.get(instance['InstanceId'], {})
+                    tags = instance.get('Tags', [])
+                    tag_dict = {tag['Key']: tag['Value'] for tag in tags}
+                    
+                    resources['ec2'].append({
+                        'Region': region,
+                        'Instance ID': instance['InstanceId'],
+                        'Name': tag_dict.get('Name', 'N/A'),
+                        'State': instance['State']['Name'],
+                        'Instance Type': instance['InstanceType'],
+                        'Platform': instance.get('Platform', 'linux'),
+                        'Private IP': instance.get('PrivateIpAddress', 'N/A'),
+                        'Public IP': instance.get('PublicIpAddress', 'N/A'),
+                        'Elastic IP': eip_info.get('PublicIp', 'N/A'),
+                        'EIP Allocation ID': eip_info.get('AllocationId', 'N/A'),
+                        'VPC ID': instance.get('VpcId', 'N/A'),
+                        'Subnet ID': instance.get('SubnetId', 'N/A'),
+                        'Key Name': instance.get('KeyName', 'N/A'),
+                        'Launch Time': str(instance.get('LaunchTime', 'N/A')),
+                        'Security Groups': ', '.join([sg['GroupId'] for sg in instance.get('SecurityGroups', [])]),
+                        'Environment': tag_dict.get('Environment', 'N/A'),
+                        'Owner': tag_dict.get('Owner', 'N/A'),
+                        'Cost Center': tag_dict.get('CostCenter', 'N/A')
+                    })
+
+        # RDS Resources
+        print("  Checking RDS instances...")
+        rds = session.client('rds', region_name=region)
+        try:
+            for db in rds.describe_db_instances()['DBInstances']:
+                resources['rds'].append({
+                    'Region': region,
+                    'DB Identifier': db['DBInstanceIdentifier'],
+                    'Status': db['DBInstanceStatus'],
+                    'Engine': f"{db['Engine']} {db['EngineVersion']}",
+                    'Instance Class': db['DBInstanceClass'],
+                    'Storage': f"{db['AllocatedStorage']} GB",
+                    'Storage Type': db['StorageType'],
+                    'Multi-AZ': db.get('MultiAZ', False),
+                    'Endpoint': db.get('Endpoint', {}).get('Address', 'N/A'),
+                    'Port': db.get('Endpoint', {}).get('Port', 'N/A'),
+                    'VPC ID': db.get('DBSubnetGroup', {}).get('VpcId', 'N/A'),
+                    'Publicly Accessible': db.get('PubliclyAccessible', False)
+                })
+        except ClientError as e:
+            print(f"  Error accessing RDS: {e}")
+
+        # VPC Resources will be handled in the next section
+        print("  Checking VPC resources...")
+        try:
+            vpcs = ec2.describe_vpcs()['Vpcs']
+            for vpc in vpcs:
+                vpc_id = vpc['VpcId']
+                try:
+                    print(f"    Processing VPC: {vpc_id}")
+                    vpc_info = get_vpc_details(ec2, vpc_id, region)
+                    if vpc_info:
+                        resources['vpc'].append(vpc_info)
+                        print(f"      Found {vpc_info.get('Route Tables', 0)} route tables")
+                        print(f"      Found {vpc_info.get('Security Groups', 0)} security groups")
+                        print(f"      Found {vpc_info.get('VPC Endpoints', 0)} endpoints")
+                        print(f"      Found {vpc_info.get('Peering Connections', 0)} peering connections")
+                        print(f"      Found {vpc_info.get('Transit Gateway Attachments', 0)} transit gateway attachments")
+                except Exception as e:
+                    print(f"    Error processing VPC {vpc_id}: {str(e)}")
+                    continue
+        except ClientError as e:
+            print(f"  Error accessing VPCs: {str(e)}")
+
+    except ClientError as e:
+        print(f"Error in region {region}: {str(e)}")
+        
+    print(f"\nResources found in {region}:")
+    print(f"    EC2 instances: {len(resources['ec2'])}")
+    print(f"    RDS instances: {len(resources['rds'])}")
+    print(f"    VPC resources: {len(resources['vpc'])}")
+    
+    return resources
 
 def get_route_table_details(ec2, vpc_id, region):
     """Get detailed information about route tables and their routes"""
@@ -511,110 +588,7 @@ def get_vpc_details(ec2, vpc_id, region):
     except ClientError as e:
         print(f"Error getting VPC details for {vpc_id}: {str(e)}")
         return {}
-
-def get_resources(session, region):
-    """Collect all AWS resources for a given region"""
-    print(f"\nAuditing region: {region}")
-    resources = {
-        'ec2': [],
-        'rds': [],
-        'vpc': []
-    }
-
-    try:
-        ec2 = session.client('ec2', region_name=region)
-        print("  Checking EC2 instances...")
-        
-        try:
-            eips = ec2.describe_addresses()['Addresses']
-            eip_map = {eip.get('InstanceId'): eip for eip in eips if eip.get('InstanceId')}
-        except ClientError as e:
-            print(f"  Error accessing EIPs: {e}")
-            eip_map = {}
-        
-        paginator = ec2.get_paginator('describe_instances')
-        for page in paginator.paginate():
-            for reservation in page['Reservations']:
-                for instance in reservation['Instances']:
-                    eip_info = eip_map.get(instance['InstanceId'], {})
-                    tags = instance.get('Tags', [])
-                    tag_dict = {tag['Key']: tag['Value'] for tag in tags}
-                    
-                    resources['ec2'].append({
-                        'Region': region,
-                        'Instance ID': instance['InstanceId'],
-                        'Name': tag_dict.get('Name', 'N/A'),
-                        'State': instance['State']['Name'],
-                        'Instance Type': instance['InstanceType'],
-                        'Platform': instance.get('Platform', 'linux'),
-                        'Private IP': instance.get('PrivateIpAddress', 'N/A'),
-                        'Public IP': instance.get('PublicIpAddress', 'N/A'),
-                        'Elastic IP': eip_info.get('PublicIp', 'N/A'),
-                        'EIP Allocation ID': eip_info.get('AllocationId', 'N/A'),
-                        'VPC ID': instance.get('VpcId', 'N/A'),
-                        'Subnet ID': instance.get('SubnetId', 'N/A'),
-                        'Key Name': instance.get('KeyName', 'N/A'),
-                        'Launch Time': str(instance.get('LaunchTime', 'N/A')),
-                        'Security Groups': ', '.join([sg['GroupId'] for sg in instance.get('SecurityGroups', [])]),
-                        'Environment': tag_dict.get('Environment', 'N/A'),
-                        'Owner': tag_dict.get('Owner', 'N/A'),
-                        'Cost Center': tag_dict.get('CostCenter', 'N/A')
-                    })
-
-        # RDS Resources
-        print("  Checking RDS instances...")
-        rds = session.client('rds', region_name=region)
-        try:
-            for db in rds.describe_db_instances()['DBInstances']:
-                resources['rds'].append({
-                    'Region': region,
-                    'DB Identifier': db['DBInstanceIdentifier'],
-                    'Status': db['DBInstanceStatus'],
-                    'Engine': f"{db['Engine']} {db['EngineVersion']}",
-                    'Instance Class': db['DBInstanceClass'],
-                    'Storage': f"{db['AllocatedStorage']} GB",
-                    'Storage Type': db['StorageType'],
-                    'Multi-AZ': db.get('MultiAZ', False),
-                    'Endpoint': db.get('Endpoint', {}).get('Address', 'N/A'),
-                    'Port': db.get('Endpoint', {}).get('Port', 'N/A'),
-                    'VPC ID': db.get('DBSubnetGroup', {}).get('VpcId', 'N/A'),
-                    'Publicly Accessible': db.get('PubliclyAccessible', False)
-                })
-        except ClientError as e:
-            print(f"  Error accessing RDS: {e}")
-
-        # VPC Resources
-        print("  Checking VPC resources...")
-        try:
-            vpcs = ec2.describe_vpcs()['Vpcs']
-            for vpc in vpcs:
-                vpc_id = vpc['VpcId']
-                try:
-                    print(f"    Processing VPC: {vpc_id}")
-                    vpc_info = get_vpc_details(ec2, vpc_id, region)
-                    if vpc_info:
-                        resources['vpc'].append(vpc_info)
-                        print(f"      Found {vpc_info.get('Route Tables', 0)} route tables")
-                        print(f"      Found {vpc_info.get('Security Groups', 0)} security groups")
-                        print(f"      Found {vpc_info.get('VPC Endpoints', 0)} endpoints")
-                        print(f"      Found {vpc_info.get('Peering Connections', 0)} peering connections")
-                        print(f"      Found {vpc_info.get('Transit Gateway Attachments', 0)} transit gateway attachments")
-                except Exception as e:
-                    print(f"    Error processing VPC {vpc_id}: {str(e)}")
-                    continue
-        except ClientError as e:
-            print(f"  Error accessing VPCs: {str(e)}")
-
-    except ClientError as e:
-        print(f"Error in region {region}: {str(e)}")
-        
-    print(f"\nResources found in {region}:")
-    print(f"    EC2 instances: {len(resources['ec2'])}")
-    print(f"    RDS instances: {len(resources['rds'])}")
-    print(f"    VPC resources: {len(resources['vpc'])}")
     
-    return resources
-
 def audit_iam(session):
     """Audit IAM resources"""
     print("\nAuditing IAM resources...")
@@ -797,8 +771,7 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
     subnets_all = []
     igw_all = []
     nat_all = []
-    route_tables_all = []
-    routes_all = []
+    combined_routes = []
     sg_all = []
     sg_rules_all = []
     endpoints_all = []
@@ -828,14 +801,31 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
         igw_all.extend(vpc.get('internet_gateways', []))
         nat_all.extend(vpc.get('nat_gateways', []))
         
+        # Process route tables and routes together
         for rt in vpc.get('route_tables', []):
-            rt_base = {k: v for k, v in rt.items() if k != 'Routes'}
-            route_tables_all.append(rt_base)
-            for route in rt.get('Routes', []):
-                route['Route Table ID'] = rt['Route Table ID']
-                route['VPC ID'] = rt['VPC ID']
-                route['Region'] = rt['Region']
-                routes_all.append(route)
+            rt_base = {
+                'Region': rt['Region'],
+                'VPC ID': rt['VPC ID'],
+                'Route Table ID': rt['Route Table ID'],
+                'Name': rt['Name'],
+                'Main': rt['Main'],
+                'Associated Subnets': rt['Associated Subnets']
+            }
+            
+            if not rt.get('Routes'):
+                # Add single entry for route table with no routes
+                combined_routes.append(rt_base)
+            else:
+                # Add entry for each route with route table info
+                for route in rt.get('Routes', []):
+                    route_entry = rt_base.copy()
+                    route_entry.update({
+                        'Destination': route['Destination'],
+                        'Target': route['Target'],
+                        'Status': route['Status'],
+                        'Origin': route['Origin']
+                    })
+                    combined_routes.append(route_entry)
         
         for sg in vpc.get('security_groups', []):
             sg_base = {k: v for k, v in sg.items() if k not in ['Inbound Rules', 'Outbound Rules']}
@@ -879,8 +869,7 @@ def write_vpc_sheets(writer, vpc_resources, header_format):
     write_dataframe(writer, 'Subnets', subnets_all, header_format)
     write_dataframe(writer, 'Internet Gateways', igw_all, header_format)
     write_dataframe(writer, 'NAT Gateways', nat_all, header_format)
-    write_dataframe(writer, 'Route Tables', route_tables_all, header_format)
-    write_dataframe(writer, 'Routes', routes_all, header_format)
+    write_dataframe(writer, 'Routes', combined_routes, header_format)
     write_dataframe(writer, 'Security Groups', sg_all, header_format)
     write_dataframe(writer, 'Security Group Rules', sg_rules_all, header_format)
     write_dataframe(writer, 'VPC Endpoints', endpoints_all, header_format)
@@ -959,6 +948,16 @@ def write_excel(all_results, output_path):
         ]
         write_dataframe(writer, 'Resource Counts', debug_info, header_format)
 
+        # Add region processing summary
+        summary_info = [
+            {'Category': 'Total Regions', 'Count': len(all_results.get('regions', {}))},
+            {'Category': 'Successful Regions', 
+             'Count': len([r for r in all_results['regions'].values() if 'error' not in r])},
+            {'Category': 'Failed Regions', 
+             'Count': len([r for r in all_results['regions'].values() if 'error' in r])}
+        ]
+        write_dataframe(writer, 'Region Summary', summary_info, header_format)
+
 def main():
     args = parse_arguments()
     
@@ -972,19 +971,29 @@ def main():
     services = args.services.lower().split(',') if args.services != 'all' else ['ec2', 'rds', 'vpc', 'iam', 's3']
     
     # Get regions to audit
-    if args.regions:
-        regions = args.regions.split(',')
-    else:
-        try:
-            ec2 = session.client('ec2')
-            regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
-        except ClientError as e:
-            print(f"Error getting regions: {str(e)}")
-            return
+    try:
+        ec2 = session.client('ec2')
+        available_regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+        
+        if args.regions.lower() == 'all':
+            regions = available_regions
+        else:
+            requested_regions = args.regions.split(',')
+            # Validate requested regions
+            invalid_regions = [r for r in requested_regions if r not in available_regions]
+            if invalid_regions:
+                print(f"Warning: Invalid regions specified: {', '.join(invalid_regions)}")
+                print("Available regions:", ', '.join(available_regions))
+                sys.exit(1)
+            regions = requested_regions
+            
+        print(f"\nAuditing {len(regions)} regions: {', '.join(regions)}")
+    except ClientError as e:
+        print(f"Error getting regions: {str(e)}")
+        return
 
     print(f"Starting AWS resource audit...")
     print(f"Services to audit: {', '.join(services)}")
-    print(f"Regions to audit: {', '.join(regions)}")
     
     all_results = {
         'regions': {},
@@ -1002,13 +1011,32 @@ def main():
     if 's3' in services:
         all_results['s3'] = audit_s3(session)
 
-    # Audit regional services
-    for region in regions:
-        try:
-            all_results['regions'][region] = get_resources(session, region)
-        except Exception as e:
-            print(f"Error in region {region}: {str(e)}")
-            all_results['regions'][region] = {'error': str(e)}
+    # Initialize progress tracking
+    print_lock = Lock()
+    total_regions = len(regions)
+    processed_regions = 0
+
+    # Process regions in parallel
+    with ThreadPoolExecutor(max_workers=min(10, len(regions))) as executor:
+        future_to_region = {executor.submit(process_region, session, region): region 
+                          for region in regions}
+        
+        for future in as_completed(future_to_region):
+            region = future_to_region[future]
+            try:
+                result = future.result()
+                with print_lock:
+                    processed_regions += 1
+                    print(f"\nProgress: {processed_regions}/{total_regions} regions processed")
+                    
+                if result is not None:
+                    all_results['regions'][region] = result
+                else:
+                    all_results['regions'][region] = {'error': 'Region processing failed or region not enabled'}
+                    
+            except Exception as e:
+                print(f"Error processing region {region}: {str(e)}")
+                all_results['regions'][region] = {'error': str(e)}
 
     # Generate reports
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
